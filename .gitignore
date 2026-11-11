@@ -1,0 +1,9 @@
+# Byte-compiled / cache
+__pycache__/
+*.pyc
+
+# Datasets are downloaded by src/prepare_data.py, not stored in the repo
+data/
+
+# Experiment logs
+*.log
