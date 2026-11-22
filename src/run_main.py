@@ -1,19 +1,22 @@
 """
 run_all_experiments.py (v2 - Protocol-Fixed Version)
 ================================================================================
-修复清单（对应论文声明的四项硬伤）：
-  P1/② abstention 协议改为「验证集调阈值」：在 val 节点上按冲突分定 80% 覆盖率
-      的阈值 tau，再原样应用到 test；同时保留 test 上直接调阈值的 oracle 版本
-      作为 Ablation #5 的「test 调优虚高」对照。
-  ①   记录真实 AUC（test 上 roc_auc(err, C)）与 test 边上的 p_e_test，
-      并计算技能增益 skill_gain = p_e_test - max(h, 1-h)。
-  ③   加回三个 abstention 基线：MSP / Predictive Entropy / MC-Dropout(20次)，
-      三者与 Conflict Field 走完全相同的 val 调阈值协议，并各自输出 AUC。
-  ④   5 个 seed（0-4）重复，全部指标输出 mean±std；扫描曲线按目标点取均值。
+Fix log (the four protocol weaknesses declared and addressed in the paper):
+  P1/(2) abstention protocol switched to validation-tuned thresholds: pick the
+      80%-coverage threshold tau from val-node conflict scores, apply it
+      unchanged to test; the test-tuned oracle variant is kept as the
+      "test-tuning inflation" control of Ablation #5.
+  (1) record the true AUC (roc_auc(err, C) on test) and p_e_test on test edges,
+      with skill gain skill_gain = p_e_test - max(h, 1-h).
+  (3) restore three abstention baselines -- MSP / Predictive Entropy /
+      MC-Dropout (20 passes) -- all under the identical val-threshold protocol,
+      each reporting its own AUC.
+  (4) 5 seeds (0-4) for every metric, reported as mean+-std; sweep curves are
+      averaged at matched target points.
 ================================================================================
 """
 import os
-# 强制覆盖可能损坏的环境变量
+# Force-override potentially stale environment variables
 os.environ["OMP_NUM_THREADS"] = "4"
 os.environ["MKL_NUM_THREADS"] = "4"
 
@@ -34,44 +37,53 @@ import matplotlib.pyplot as plt
 import pandas as pd
 
 # ============================================================
-# 0. 实验配置
+# 0. Experiment configuration
 # ============================================================
 SEEDS = [int(s) for s in os.environ.get("CF_SEEDS", "0,1,2,3,4").split(",")]
 N_DROPOUT_PASSES = 20
 ABST_COVERAGES = [0.6, 0.7, 0.8, 0.9]
 
-# 诊断实验开关（默认全关，不改变既有复现结果）：
-# CF_EDGE_BALANCED=1  → 边分类器加 class_weight='balanced'，抵消先验 h 主导标签分布
-#                        造成的塌缩（强异配图 h≈0.06 时全预测多数类就有 94% 准确率）
+# Diagnostic switches (all off by default; they do not change existing results):
+# CF_EDGE_BALANCED=1  -> adds class_weight='balanced' to the edge classifier, countering
+#                        the collapse caused by the prior h dominating the label distribution
+#                        (on strongly heterophilous graphs h~0.06, predicting the majority class alone yields 94%).
 EDGE_BALANCED = os.environ.get("CF_EDGE_BALANCED", "0") == "1"
-# CF_EDGE_CALIB=<raw|rank|z|otsu>  → 边概率的 label-free 重标定（只影响 unsup 分支的诊断）
-#   动机：unsup 的 p_uv=(cos+1)/2 在所有图上均值 0.85~0.98，阈值 0.5 等于「全判同类」，
-#   p_e 恰好退化为 h。真实最优阈值在 0.92~0.95。这说明 p 的绝对值无校准意义、只有排序有意义，
-#   因此用不依赖标签的重标定把 p 拉回可用区间：
-#     rank -- 秩归一化，阈值 0.5 即中位数（假设 h=0.5，对 soft 单调等价、不影响其排序）
-#     z    -- z-score 后 sigmoid（同上，自适应均值方差）
-#     otsu -- 直方图 Otsu 二值化，完全自适应，不假设 h
+# CF_EDGE_CALIB=<raw|rank|z|otsu>  -> label-free recalibration of edge probabilities
+#   (diagnostics for the unsup branch only). Motivation: the unsup p_uv=(cos+1)/2 has
+#   mean 0.85-0.98 on every graph, so a 0.5 threshold means "declare every edge
+#   same-class" and p_e degenerates to h; the true optimum sits at 0.92-0.95. The
+#   absolute value of p has no calibration meaning -- only its ranking does -- so a
+#   label-free recalibration maps p back into a usable range:
+#     rank -- rank normalisation; threshold 0.5 = the median (monotone in the soft score,
+#     z    -- z-score then sigmoid (adapts to mean and variance)
+#     otsu -- histogram Otsu binarisation; fully adaptive, no assumption on h
 EDGE_CALIB = os.environ.get("CF_EDGE_CALIB", "raw")
-# CF_CONFLICT_MODE=soft → 软冲突值（后验期望），默认 hard 保持既有结果
-# CF_CONFLICT_MODE=nbr  → 软冲突值 + 边的邻居冲突值（一次 O(|E|) 重写，见 §3）
+# CF_CONFLICT_MODE=soft -> soft conflict values (posterior expectation); default hard
+#                        keeps existing results
+# CF_CONFLICT_MODE=nbr  -> soft conflict values + neighbour-edge conflict
+#                        (one O(|E|) rewrite, see Section 3)
 CONFLICT_MODE = os.environ.get("CF_CONFLICT_MODE", "hard")
-# curate2 的两个算子（消融用；默认即论文主方法）
+# The two operators of curate2 (for ablations; the defaults are the paper's method):
 CURATE_AGG = os.environ.get("CF_AGG", "sym")          # sym | mean
 CURATE_COMBINE = os.environ.get("CF_COMBINE", "avg")  # avg | none
-# 邻居重写强度 α：q_e=(1−α)c_e+α·(邻居边平均冲突)。α=0 完全退回原方法。
+# Neighbour-rewrite strength alpha: q_e=(1-alpha)c_e+alpha*(mean neighbour-edge conflict).
+#                        alpha=0 falls back to the original method entirely.
 NBR_ALPHAS = (-1.0, -0.5, 0.25, 0.5, 1.0, 2.0)
-# nbr2 的乘性对比强度：C·(1−b·M)，M 为邻居冲突本底
+# Multiplicative contrast strength of nbr2: C*(1-b*M), M the neighbour conflict background.
 NBR_PROD_BETAS = (0.5, 1.0, 1.5)
-# nbr3：机制由「平均冲突水平」C̄=mean_v C(v) 硬门控（只用冲突场自身信息，无标签、不用 h）
-# C̄ 低 → 冲突稀疏、邻居冲突是噪声 → 平滑；C̄ 高 → 冲突遍地 → 乘性对比。
-# 11 个数据集上 C̄ 的两簇是 0.08–0.16 与 0.54–0.90，阈值落在这段空白里对取值不敏感。
+# nbr3: the mechanism is hard-gated by the mean conflict level Cbar=mean_v C(v)
+# (uses only the conflict field itself: no labels, no h). A low Cbar -> conflict is
+# sparse and neighbour conflict is mostly noise -> smooth; a high Cbar -> conflict is
+# everywhere -> multiplicative contrast. On the 11 benchmarks Cbar forms two clusters,
+# 0.08-0.16 and 0.54-0.90; a threshold inside that gap is insensitive to its exact value.
 NBR_TAU = float(os.environ.get("CF_NBR_TAU", "0.35"))
 NBR_PROD_BETA = float(os.environ.get("CF_NBR_BETA", "1.5"))
-# val 上提升不足该阈值就退回 α=0（防止选择噪声把结果改坏）
+# Fall back to alpha=0 when the val gain is below this margin (prevents selection noise
+# from degrading results).
 NBR_MARGIN = float(os.environ.get("CF_NBR_MARGIN", "0.005"))
 
 # ============================================================
-# 1. 独立的数据加载逻辑（本地路径，绝不联网）
+# 1. Self-contained data loading (local paths, never downloads at run time)
 # ============================================================
 def get_fixed_split(num_nodes, seed=42):
     rng = torch.Generator().manual_seed(seed)
@@ -106,7 +118,7 @@ def load_npz_generic(npz_path, split_idx):
     ei = coalesce(to_undirected(ei))
 
     num_splits = obj["train_masks"].shape[0]
-    real_split = split_idx % num_splits  # 官方 10 个划分，seed 轮换
+    real_split = split_idx % num_splits  # 10 official splits, rotated by seed
 
     return Data(
         x=torch.tensor(X, dtype=torch.float), edge_index=ei,
@@ -117,7 +129,8 @@ def load_npz_generic(npz_path, split_idx):
     )
 
 def _symmetrize_edge_index(ei):
-    """去重并双向化（与 load_npz_generic 相同的口径：h 按去重无向图计）。"""
+    """Deduplicate and symmetrise (same convention as load_npz_generic: h is computed
+    on the deduplicated undirected graph)."""
     src, dst = ei[0].numpy(), ei[1].numpy()
     ue = set(zip(np.minimum(src, dst).tolist(), np.maximum(src, dst).tolist()))
     ei = torch.tensor([[e[0] for e in ue], [e[1] for e in ue]], dtype=torch.long)
@@ -125,14 +138,14 @@ def _symmetrize_edge_index(ei):
 
 
 def load_external(name, split_seed, root):
-    """三个公开大规模图（NeurIPS'21 非同配基准 + Platonov release）：
+    """Three public large-scale graphs (NeurIPS'21 non-homophily benchmark + Platonov release):
 
-    genius        421,961 节点 / 922,868 边   h≈0.59   C=2  Lim & Benson 2020
-                  （2023 更新版数据；无官方划分 → 随机 60/20/20，seed 控制）
-    penn94         41,554 节点 / 1,362,229 边 h≈0.47   C=2  Traud et al. 2012
-                  （官方 5 个划分，seed 轮换；性别标签，0 为未标注）
-    roman_empire   22,662 节点 /  66,566 边   h≈0.20   C=18 Platonov et al. 2022
-                  （官方 10 个划分，seed 轮换）
+    genius        421,961 nodes / 922,868 edges   h~0.59   C=2  Lim & Benson 2020
+                  (2023 updated release; no official split -> random 60/20/20, seed-controlled)
+    penn94         41,554 nodes / 1,362,229 edges h~0.47   C=2  Traud et al. 2012
+                  (5 official splits, rotated by seed; gender label, 0 = unlabeled)
+    roman_empire   22,662 nodes /  66,566 edges   h~0.20   C=18 Platonov et al. 2022
+                  (10 official splits, rotated by seed)
     """
     import scipy.io as sio
 
@@ -151,10 +164,10 @@ def load_external(name, split_seed, root):
         d = sio.loadmat(os.path.join(root, "Penn94.mat"))
         A = d["A"].tocsr()
         metadata = d["local_info"].astype(np.float64)
-        y = (metadata[:, 1] - 1).astype(np.int64)          # 性别；0-1=-1 未标注
+        y = (metadata[:, 1] - 1).astype(np.int64)          # gender; 0-1 = -1 (unlabeled)
         ei = torch.tensor(np.vstack(A.nonzero()), dtype=torch.long)
         ei = _symmetrize_edge_index(ei)
-        # 特征：year + 其余元数据列逐列 one-hot（Lim et al. 的处理）
+        # features: year + per-column one-hot of the remaining metadata (Lim et al.)
         vals = np.hstack((metadata[:, :1], metadata[:, 2:]))
         feats = []
         for col in range(vals.shape[1]):
@@ -164,7 +177,7 @@ def load_external(name, split_seed, root):
         N = len(y)
         labeled = torch.tensor(y >= 0)
         sp = np.load(os.path.join(root, "penn94_splits.npy"), allow_pickle=True)
-        # 官方 5 个划分：元素为 {'train': [...], 'valid': [...], 'test': [...]}
+        # 5 official splits: each element is {'train': [...], 'valid': [...], 'test': [...]}
         if sp.dtype == object and len(sp) == 5:
             item = sp[split_seed % len(sp)]
             trm = torch.zeros(N, dtype=torch.bool); trm[torch.tensor(item["train"])] = True
@@ -173,7 +186,7 @@ def load_external(name, split_seed, root):
             trm &= labeled; vlm &= labeled; tem &= labeled
             return Data(x=torch.tensor(X), edge_index=ei, y=torch.tensor(y),
                         train_mask=trm, val_mask=vlm, test_mask=tem)
-        # 兜底：随机 60/20/20（只在 labeled 节点上切）
+        # fallback: random 60/20/20 (over labeled nodes only)
         idx = np.where(y >= 0)[0]
         rng = np.random.RandomState(1000 + split_seed)
         perm = rng.permutation(idx)
@@ -204,7 +217,8 @@ def load_external(name, split_seed, root):
 
 
 def load_dataset(name, split_seed=0):
-    # 数据路径：默认读取本目录下 prepare_data.py 生成的 data/，可用环境变量覆盖
+    # Data paths: by default read data/ produced by prepare_data.py in this directory;
+    # overridable through environment variables.
     _here = os.path.dirname(os.path.abspath(__file__))
     HETERO_ROOT = os.environ.get("CF_HETERO_ROOT", os.path.join(_here, "data", "hetero"))
     PLANETOID_ROOT = os.environ.get("CF_PLANETOID_ROOT", os.path.join(_here, "data", "planetoid"))
@@ -222,7 +236,7 @@ def load_dataset(name, split_seed=0):
     if name in ["cora", "citeseer", "pubmed"]:
         from torch_geometric.datasets import Planetoid
         d = Planetoid(root=PLANETOID_ROOT, name=name.capitalize())[0].clone()
-        # 论文协议：随机 60/20/20 切分，seed 控制切分随机性
+        # paper protocol: random 60/20/20 split; seed controls split randomness
         tr, vl, te = get_fixed_split(d.num_nodes, seed=split_seed)
         d.train_mask, d.val_mask, d.test_mask = tr, vl, te
         return d
@@ -237,7 +251,7 @@ def load_dataset(name, split_seed=0):
         raise ValueError(f"Unknown dataset: {name}")
 
 # ============================================================
-# 2. GCN 模型与预测（原始特征 + Jaccard）
+# 2. GCN model and predictions (raw features + Jaccard)
 # ============================================================
 class GCN(torch.nn.Module):
     def __init__(self, in_dim, hidden, out_dim, dropout=0.5):
@@ -245,11 +259,12 @@ class GCN(torch.nn.Module):
         self.c1 = GCNConv(in_dim, hidden); self.c2 = GCNConv(hidden, out_dim)
         self.dropout = dropout
     def encode(self, x, ei):
-        """第一层 GCN 之后的隐藏表征 z_v（dim=hidden）。
+        """Hidden representation z_v after the first GCN layer (dim = hidden).
 
-        论文 §III 的边一致性明确由「模型自身的 latent embedding」计算，
-        因此审计阶段应当在 z 上做相似度，而不是在原始输入特征 x 上做。
-        z 的维度是 64，与输入特征维度 d 无关 —— 这正是 O(|E|·d) -> O(|E|·64) 的来源。
+        The paper's Sec. III defines edge consistency on the model's own latent
+        embedding, so the audit must measure similarity on z, not on the raw input
+        features x. z has fixed dimension 64 regardless of the input dimension d --
+        this is where O(|E|*d) -> O(|E|*64) comes from.
         """
         return F.relu(self.c1(x, ei))
     def forward(self, x, ei):
@@ -282,12 +297,14 @@ def train_gcn(data, C, seed, epochs=200, hidden=64, lr=0.01, weight_decay=5e-4):
     return model, best_out
 
 def mc_dropout_risk(model, data, n_passes=N_DROPOUT_PASSES, force_cpu=True):
-    """MC-Dropout：仅将 Dropout 层置于 train 模式，做 n_passes 次随机前向，
-    风险分数 = 平均预测分布的预测熵（标准选择性预测基线）。
+    """MC-Dropout: put only the Dropout layers into train mode, take n_passes stochastic
+    forward passes; the risk score is the entropy of the mean predictive distribution
+    (the standard selective-prediction baseline).
 
-    force_cpu: 把计时口径统一到 CPU。Conflict Field 全流程是 numpy/CPU 向量化，
-    若 MC-Dropout 在 GPU 上计时，两者不在同一硬件上，比出来的加速比没有意义。
-    前向在 CPU 上做，熵值与 GPU 一致（同一模型、同一权重、同一 dropout 掩码分布）。
+    force_cpu: unify timing on CPU. The Conflict Field pipeline is vectorised numpy/CPU;
+    timing MC-Dropout on a GPU would compare across different hardware and make the
+    speed-up meaningless. The forward pass runs on CPU and the entropy matches the GPU
+    run (same model, same weights, same dropout-mask distribution).
     """
     on_cuda = next(model.parameters()).is_cuda
     if force_cpu and on_cuda:
@@ -319,20 +336,22 @@ def mc_dropout_risk(model, data, n_passes=N_DROPOUT_PASSES, force_cpu=True):
 
 def get_predictions(data, C_num, y_np, seed=0, edge_mode="sup",
                     edge_space="auto", edge_feat="full"):
-    """训练 GCN 并计算边一致性分数。
+    """Train a GCN and compute edge-consistency scores.
 
     edge_mode:
-      "sup"   -- 用训练边标签拟合 LR（主配置；审计阶段无需任何标签）
-      "unsup" -- 纯余弦阈值，完全不碰标签（Ablation #1 对照）
+      "sup"   -- logistic regression fitted on training-edge labels (main configuration;
+                 no labels needed at audit time)
+      "unsup" -- pure cosine threshold, touches no labels (Ablation #1 control)
     edge_space:
-      "auto"  -- d > 64 时用 latent embedding（降维到 64），否则用原始特征。默认。
-                 复杂度 O(|E|·min(d, 64))：既不让高维图爆内存，也不给低维图无谓加维。
-      "emb"   -- 强制用 latent embedding（论文 §III 的字面定义）
-      "raw"   -- 强制用原始输入特征（旧实现）
+      "auto"  -- use the latent embedding when d > 64 (project to 64), else raw features.
+                 Default. Complexity O(|E|*min(d, 64)): avoids blowing up memory on
+                 high-dimensional graphs without adding dimensions on low-dimensional ones.
+      "emb"   -- force the latent embedding (the literal Sec. III definition)
+      "raw"   -- force raw input features (legacy implementation)
     edge_feat:
-      "full"    -- cos + log1p(|deg差|) + 二值重叠度（3 特征）
-      "cos_deg" -- cos + log1p(|deg差|)（2 特征，最省）
-      "cos"     -- 仅 cos
+      "full"    -- cos + log1p(|deg diff|) + binary overlap (3 features)
+      "cos_deg" -- cos + log1p(|deg diff|) (2 features, cheapest)
+      "cos"     -- cos only
     """
     N = data.num_nodes
     model, logits = train_gcn(data, C_num, seed)
@@ -341,25 +360,28 @@ def get_predictions(data, C_num, y_np, seed=0, edge_mode="sup",
     conf = probs.max(1)
     entropy = -(probs * np.log(probs + 1e-12)).sum(1)
 
-    # ---------------- 审计阶段计时 ----------------
-    # 论文 §V 只应报这一段：拿到训练好的模型之后，审计一张图需要多少时间。
-    # 边预测器的拟合是一次性开销，单独记为 t_fit，不与审计成本混算。
+    # ---------------- audit-stage timing ----------------
+    # The paper reports only this segment: how long it takes to audit one graph once
+    # the model is trained. The one-off edge-scorer fit is timed separately as t_fit
+    # and never mixed into the audit cost.
+    # the one-off edge-scorer fit is timed separately as t_fit and never mixed into the audit cost.
     t0 = time.perf_counter()
     src, dst = data.edge_index[0].cpu().numpy(), data.edge_index[1].cpu().numpy()
 
     if edge_space == "auto":
-        # 只在降维有意义时才用 embedding：d > hidden(64) 才换空间。
-        # Cora(d=1433)/Squirrel(d=2089) 走 emb，Tolokers(d=1) 留在 raw。
+        # project only when it matters: switch to the embedding when d > hidden(64).
+        # Cora (d=1433) / Squirrel (d=2089) use emb; Tolokers (d=1) stays on raw.
         use_emb = data.num_features > 64
     else:
         use_emb = (edge_space == "emb")
 
     if use_emb:
-        # 论文 §III：边一致性由模型自身的 latent embedding 计算（dim=64，与特征维 d 无关）
+        # Sec. III: edge consistency is computed on the model's own latent embedding
+        # (dim=64, independent of the feature dimension d)
         with torch.no_grad():
             Z = model.encode(data.x, data.edge_index).cpu().numpy().astype(np.float32)
     else:
-        Z = data.x.cpu().numpy().astype(np.float32)   # 低维图：原始输入特征本身更省
+        Z = data.x.cpu().numpy().astype(np.float32)   # low-dim graph: raw features are cheaper
 
     Zn = Z / (np.linalg.norm(Z, axis=1, keepdims=True) + 1e-9)
     t_embed = time.perf_counter() - t0
@@ -374,9 +396,10 @@ def get_predictions(data, C_num, y_np, seed=0, edge_mode="sup",
     if edge_feat in ("cos_deg", "full", "pred"):
         feats.append(np.log1p(np.abs(deg[src] - deg[dst])))
     if edge_feat in ("full", "pred"):
-        # 二值重叠度。分块计算，避免 E x d 的稠密中间量：
-        # 旧写法 x_bin[src]*x_bin[dst] 在 Squirrel 上要 4.6e9 次乘法 + 18GB 临时内存，
-        # 这是旧实现「O(|E|)」声明失效、Squirrel 耗时 4.16s 的真正原因。
+        # Binary overlap. Chunked to avoid a dense E x d intermediate: the naive
+        # x_bin[src]*x_bin[dst] costs 4.6e9 multiplications and an 18 GB temporary on
+        # Squirrel -- that is why the old implementation broke its O(|E|) claim and
+        # took 4.16 s on Squirrel.
         x_bin = (Z > 0).astype(np.float32)
         row_nnz = x_bin.sum(1)
         jac = np.empty(len(src), dtype=np.float32)
@@ -389,19 +412,21 @@ def get_predictions(data, C_num, y_np, seed=0, edge_mode="sup",
         t_jac = time.perf_counter() - t0
         feats.append(jac)
     if edge_feat == "pred":
-        # 预测感知边特征（全部 label-free：只用模型自身输出，审计阶段不读任何标签）。
-        # 动机：同质图上 embedding cos 塌缩为常数（同类邻居天然相似），e_pred 失去信息。
-        # 1) 原始特征余弦：embedding 之外补一个输入空间的视角
+        # Prediction-aware edge features (all label-free: model outputs only, no labels
+        # read at audit time).
+        # Motivation: on homophilous graphs the embedding cosine collapses to a constant
+        # (same-class neighbours are naturally similar) and e_pred loses information.
+        # 1) raw-feature cosine: an input-space view complementing the embedding
         Xr = data.x.cpu().numpy().astype(np.float32)
         Xrn = Xr / (np.linalg.norm(Xr, axis=1, keepdims=True) + 1e-9)
         feats.append((Xrn[src] * Xrn[dst]).sum(1))
-        # 2) 端点预测分布的 JS 散度：错分节点与正确邻居的预测分布不同
+        # 2) JS divergence of the endpoint predictive distributions: misclassified nodes differ
         P = np.clip(probs, 1e-12, 1.0)
         M = 0.5 * (P[src] + P[dst])
         kl_u = (P[src] * (np.log(P[src]) - np.log(M))).sum(1)
         kl_v = (P[dst] * (np.log(P[dst]) - np.log(M))).sum(1)
         feats.append((0.5 * (kl_u + kl_v)).astype(np.float32))
-        # 3) 端点置信度差
+        # 3) endpoint confidence gap
         feats.append(np.abs(conf[src] - conf[dst]).astype(np.float32))
 
     X_edge = np.stack(feats, 1)
@@ -422,7 +447,8 @@ def get_predictions(data, C_num, y_np, seed=0, edge_mode="sup",
     t_fit = t_pred = 0.0
     if edge_mode == "sup" and mask_tr.sum() >= 20:
         y_edge_tr = e_true_all[mask_tr]
-        # 训练边必须两类都有，否则 LR 退化为常数预测（小图/极端异配时会发生）
+        # both classes must appear among training edges, otherwise the LR collapses
+        # to a constant predictor (happens on small / extremely heterophilous graphs)
         if len(np.unique(y_edge_tr)) == 2:
             if mask_tr.sum() > 50000:
                 idx = rng.choice(np.where(mask_tr)[0], 50000, replace=False)
@@ -436,7 +462,7 @@ def get_predictions(data, C_num, y_np, seed=0, edge_mode="sup",
             lr.fit(X_fit, y_fit)
             t_fit = time.perf_counter() - t0
 
-            # in-sample（train 边，仅供参考，有虚高偏差）
+            # in-sample (train edges; reference only, optimistically biased)
             e_pred_tr = (lr.predict_proba(X_fit)[:, 1] >= 0.5).astype(int)
             p_e_train = float((e_pred_tr == y_fit).mean())
 
@@ -445,10 +471,12 @@ def get_predictions(data, C_num, y_np, seed=0, edge_mode="sup",
             t_pred = time.perf_counter() - t0
             edge_fit_ok = True
 
-    # ---- label-free 重标定（只对 unsup 的余弦伪概率有意义；sup 的 LR 输出已校准）----
+    # ---- label-free recalibration (only meaningful for the unsup cosine pseudo-
+    # probabilities; the sup LR output is already calibrated) ----
     if EDGE_CALIB != "raw" and edge_mode == "unsup" and len(p_uv) > 100:
         if EDGE_CALIB == "rank":
-            # 秩归一化：p 的绝对值不可信，只保留排序。阈值 0.5 即中位数。
+            # rank normalisation: the absolute value of p is untrustworthy, keep only
+            # the ranking; a 0.5 threshold is the median.
             order = np.argsort(p_uv, kind="stable")
             r = np.empty(len(p_uv), dtype=np.float32)
             r[order] = np.arange(len(p_uv), dtype=np.float32)
@@ -457,7 +485,8 @@ def get_predictions(data, C_num, y_np, seed=0, edge_mode="sup",
             mu, sd = float(p_uv.mean()), float(p_uv.std() + 1e-9)
             p_uv = (1.0 / (1.0 + np.exp(-(p_uv - mu) / sd))).astype(np.float32)
         elif EDGE_CALIB == "otsu":
-            # 直方图 Otsu：最大化类间方差，完全自适应、不假设 h
+            # histogram Otsu: maximise between-class variance; fully adaptive, no
+            # assumption on h
             hist, edges = np.histogram(p_uv, bins=256, range=(0.0, 1.0))
             hist = hist.astype(np.float64)
             w0 = np.cumsum(hist)
@@ -470,8 +499,10 @@ def get_predictions(data, C_num, y_np, seed=0, edge_mode="sup",
             p_uv = ((p_uv - thr) / max(1e-3, float(p_uv.max() - thr)) * 0.5 + 0.5)
             p_uv = np.clip(p_uv, 0.0, 1.0).astype(np.float32)
 
-    # p_e 只有在边预测器真正有效时才报告：sup 需拟合成功，unsup 用余弦阈值。
-    # 否则留 NaN —— 退化预测器的 "精度" 是假象（例如全预测多数类的 1-h）。
+    # p_e is reported only when the edge predictor actually works: sup requires a
+    # successful fit, unsup uses the cosine threshold. Otherwise it stays NaN -- the
+    # "accuracy" of a degenerate predictor is an illusion (e.g. the majority-class rate 1-h).
+    # the "accuracy" of a degenerate predictor is an illusion (e.g. the majority-class rate 1-h).
     if edge_mode == "unsup" or edge_fit_ok:
         if mask_va.sum() >= 20:
             p_e_val = float(((p_uv[mask_va] >= 0.5).astype(int) == e_true_all[mask_va]).mean())
@@ -481,25 +512,26 @@ def get_predictions(data, C_num, y_np, seed=0, edge_mode="sup",
     e_pred = (p_uv >= 0.5).astype(int)
     t_audit = t_embed + t_sim + t_jac + t_pred
     return {
-        "model": model, "probs": probs,          # T2 融合需要完整概率分布
+        "model": model, "probs": probs,          # full distributions needed for score fusion
         "y_pred": y_pred, "conf": conf, "entropy": entropy,
-        "e_pred": e_pred, "p_uv": p_uv,          # 连续边判定概率，供软冲突值实验使用
+        "e_pred": e_pred, "p_uv": p_uv,          # continuous edge verdicts, for soft-conflict experiments
         "e_true_all": e_true_all, "p_e_train": p_e_train,
         "p_e_val": p_e_val, "p_e_test": p_e_test, "edge_mode": edge_mode,
         "edge_space": ("emb" if use_emb else "raw") , "edge_space_arg": edge_space,
         "edge_feat": edge_feat,
         "edge_fit_ok": edge_fit_ok, "n_train_edges": int(mask_tr.sum()),
-        # t_edge 保留旧字段名，语义已改为「审计阶段」，不含一次性拟合
+        # t_edge keeps its legacy field name; its meaning is now "audit stage",
+        # excluding the one-off fit
         "t_edge": t_audit, "t_audit": t_audit, "t_fit": t_fit,
         "t_embed": t_embed, "t_sim": t_sim, "t_jac": t_jac, "t_pred": t_pred,
         "src": src, "dst": dst, "deg": deg, "N": N, "E": len(src)
     }
 
 # ============================================================
-# 3. 计算与实验
+# 3. Computation and experiments
 # ============================================================
 def _edge_disagree(y_pred, e_pred, src, dst, p_uv=None, mode="hard"):
-    """边级分歧 c_uv（hard: 0/1 指示；soft: Bernoulli 后验期望）。"""
+    """Edge-level disagreement c_uv (hard: a 0/1 indicator; soft: the Bernoulli posterior expectation)."""
     same_pred = (y_pred[src] == y_pred[dst]).astype(np.float32)
     if mode == "soft" and p_uv is not None:
         p = np.asarray(p_uv, dtype=np.float32)
@@ -508,7 +540,7 @@ def _edge_disagree(y_pred, e_pred, src, dst, p_uv=None, mode="hard"):
 
 
 def _edge_cos(A, src, dst, budget=4_000_000):
-    """逐边余弦，分块计算避免 |E|×d 的稠密中间量（Squirrel 上会吃掉几十 GB）。"""
+    """Per-edge cosine, chunked to avoid a dense |E| x d intermediate (which would eat tens of GB on Squirrel)."""
     An = A / (np.linalg.norm(A, axis=1, keepdims=True) + 1e-9)
     out = np.empty(len(src), dtype=np.float32)
     d = A.shape[1]
@@ -526,10 +558,12 @@ def _node_agg(c_e, src, dst, deg, N, agg="mean"):
         np.maximum.at(C, dst, c_e)
         return C
     if agg == "sym":
-        # 邻居侧 √、自身侧线性：C(v)=Σ_u c_uv/(d_v·√d_u)。
-        # 等价于先按 1/√(d_u d_v) 给边加权、聚合后再除以 √d_v（即 D^{-1}AD^{-1/2}）。
-        # 与"除以度"相比：hub 邻居不再以 1/d 的微弱权重混入，也不再以 d 倍放大自己；
-        # 代价是多一次逐边除法（O(|E|)，无新内存）。
+        # neighbour side sqrt, self side linear: C(v)=sum_u c_uv/(d_v*sqrt(d_u)).
+        # Equivalent to weighting each edge by 1/sqrt(d_u d_v), aggregating, then
+        # dividing by sqrt(d_v) (i.e. D^{-1} A D^{-1/2}).
+        # Compared with plain degree division: a hub neighbour no longer leaks in with
+        # weight 1/d nor amplifies itself by d; the cost is one extra per-edge division
+        # (O(|E|), no new memory).
         w = c_e / np.sqrt(np.maximum(deg[src] * deg[dst], 1.0))
         num = np.bincount(src, weights=w, minlength=N) + \
             np.bincount(dst, weights=w, minlength=N)
@@ -540,29 +574,32 @@ def _node_agg(c_e, src, dst, deg, N, agg="mean"):
 
 
 def neighbor_inv_denom(deg, src, dst):
-    """1/(deg_u+deg_v−2)：只与拓扑有关，hard/soft 两种基冲突值共用，避免重复除一次。"""
+    """1/(deg_u+deg_v-2): purely topological, shared by the hard and soft base conflict values to avoid a redundant division."""
     du, dv = deg[src], deg[dst]
     return (1.0 / np.maximum(du + dv - 2.0, 1.0)).astype(np.float32)
 
 
 def neighbor_conflict_pair(c_e, src, dst, deg, N, inv_denom=None, agg="mean"):
-    """把每条边的冲突值再往它的「邻居边」传一步，返回 (C_self, C_nbr)。
+    """Propagate each edge's conflict value one step onto its "neighbour edges";
+    returns (C_self, C_nbr).
 
-    每条边的邻居边 = 与它共享端点的其它边。对边 e=(u,v)：
+    The neighbour edges of e=(u,v) are the other edges sharing an endpoint with it:
         m_e = (Σ_{e'∋u} c_e' + Σ_{e'∋v} c_e' − 2c_e) / (deg_u + deg_v − 2)
-    即「这条边周围的平均冲突水平」。重写后回到节点级得到 C_nbr。
+    the mean conflict level around this edge. After rewriting, node-level aggregation yields C_nbr.
 
-    关键：重写 q_e=(1−α)c_e+α·m_e 对 α 是线性的，故
+    Key fact: the rewrite q_e=(1-alpha)c_e+alpha*m_e is linear in alpha, so the whole
         C(α) = (1−α)·C_self + α·C_nbr
-    整族 α 只需上面这两个向量，扫参数是 O(N) 混合 —— 不重复走边。
-    成本：2 次 bincount（m_e 的 src/dst 聚合），O(|E|) 时间、O(N+|E|) 内存，
-    没有矩阵乘、没有 O(E·d) 中间量。
+    alpha family needs only these two vectors; sweeping alpha is an O(N) blend --
+    edges are never re-walked.
+    Cost: 2 bincounts (the src/dst aggregation of m_e), O(|E|) time and O(N+|E|) memory;
+    no matrix products, no O(E*d) intermediates.
 
-    agg: 节点级聚合算子，与 _node_agg 一致（"mean" 除以度 / "sym" 对称归一化）。
+    agg: node-level aggregation operator, same as _node_agg ("mean" divides by degree /
+    "sym" symmetric normalisation).
     """
     C_self = _node_agg(c_e, src, dst, deg, N, agg=agg)
     if agg == "mean":
-        S = C_self * deg                  # Σ_{e∋u} c_e，复用已算好的分子，不再 bincount
+        S = C_self * deg                  # sum of c_e over edges incident to u; numerator reused, no extra bincount
     else:
         S = np.bincount(src, weights=c_e, minlength=N) + \
             np.bincount(dst, weights=c_e, minlength=N)
@@ -575,19 +612,25 @@ def neighbor_conflict_pair(c_e, src, dst, deg, N, inv_denom=None, agg="mean"):
 
 def compute_C_and_err(y_pred, e_pred, src, dst, deg, y_np, p_uv=None, mode="hard", agg="mean",
                       alpha=0.0):
-    """Algorithm 1 第 2 阶段：把边级分歧聚合为节点级冲突分 C(v)，并给出真实误差向量。
+    """Algorithm 1, phase 2: aggregate edge-level disagreement into the node-level
+    conflict score C(v), and return the true error vector.
 
-    mode="hard": c_uv = I(ŷu=ŷv) XOR ê_uv，边判定取 0/1（原始实现）
-    mode="soft": c_uv = E[同上]，把边判定换成其后验概率 p_uv：
+    mode="hard": c_uv = I(yhat_u=yhat_v) XOR ehat_uv, a 0/1 edge verdict (the original implementation)
+    mode="soft": c_uv = E[same quantity], the 0/1 verdict replaced by its posterior
+                 probability p_uv:
                  c_uv = I(ŷu=ŷv)·(1−p_uv) + I(ŷu≠ŷv)·p_uv
-                 硬指标是同一量的 Bernoulli 抽样，取期望只去掉抽样噪声，
-                 不引入任何新信息（p_uv 来自已拟合的边分类器，审计期仍 label-free）。
-    agg="mean": C(v) = Σ_u c_uv / |N(v)|（原实现，度归一化）
-    agg="max":  C(v) = max_u c_uv（最坏邻边冲突；某一条高度可疑的边即可暴露节点，
-                适合冲突稀疏、均值被大量 0 稀释的情形）
-    alpha:      边的邻居冲突值重写强度（见 neighbor_conflict_pair），默认 0 = 原方法。
+                 the hard indicator is a Bernoulli sample of the same quantity; taking
+                 the expectation only removes sampling noise and introduces no new
+                 information (p_uv comes from the fitted edge classifier and remains
+                 label-free at audit time).
+    agg="mean": C(v) = sum_u c_uv / |N(v)| (the original, degree normalisation)
+    agg="max":  C(v) = max_u c_uv (worst neighbouring-edge conflict; a single highly
+                suspicious edge exposes the node -- suited to graphs where conflict is
+                sparse and the mean gets diluted by many zeros)
+    alpha:      neighbour-rewrite strength (see neighbor_conflict_pair); default 0 = the original method.
 
-    返回 (C, err, t_agg)，t_agg 为聚合阶段墙钟耗时，供 Scalability 一节引用。
+    Returns (C, err, t_agg); t_agg is the wall-clock time of the aggregation stage,
+    cited in the Scalability section.
     """
     t0 = time.perf_counter()
     N = len(y_np)
@@ -604,8 +647,9 @@ def compute_C_and_err(y_pred, e_pred, src, dst, deg, y_np, p_uv=None, mode="hard
     return C, err, t_agg
 
 def neighborhood_inconsistency(y_pred, src, dst, deg):
-    """零成本基线：邻域预测标签一致度。风险 = 1 - (邻居中预测标签与自身相同的比例)。
-    只用预测标签，不用特征、不用边分类器，是论文 §IV Ablation #3 的对照基线。"""
+    """Zero-cost baseline: neighbourhood predicted-label agreement. Risk = 1 - (fraction
+    of neighbours whose predicted label equals the node's). Uses only predicted labels
+    -- no features, no edge classifier; the Ablation #3 control in the paper."""
     N = len(y_pred)
     same = (y_pred[src] == y_pred[dst]).astype(np.float32)
     agree = np.bincount(src, weights=same, minlength=N) + \
@@ -685,14 +729,15 @@ def exp_C_scan_pn(pred, y_np, test_mask, pn_targets=None, C_num=None):
     return results
 
 # ============================================================
-# 【② P1 修复】abstention：验证集调阈值 + test oracle 对照
+# [abstention, fixed] validation-tuned thresholds + test-oracle control
 # ============================================================
 def abstention_eval(risk_val, correct_val, risk_test, correct_test,
                     coverages=ABST_COVERAGES):
-    """对所有方法统一的协议：
-    - val 协议（无泄漏）：tau = val 节点风险分的覆盖率分位数，原样应用到 test；
-    - test oracle（泄漏对照）：tau 直接取 test 自身的覆盖率分位数，
-      用于复现 Ablation #5 声称的「test 调优导致精度虚高」。"""
+    """The protocol shared by every method:
+    - val protocol (leak-free): tau = the coverage quantile of risk scores on val
+      nodes, applied unchanged to test;
+    - test oracle (leakage control): tau taken from the test scores themselves,
+      reproducing the "test tuning inflates accuracy" claim of Ablation #5."""
     out = {}
     n_val, n_test = len(risk_val), len(risk_test)
     for cov in coverages:
@@ -712,16 +757,19 @@ def abstention_eval(risk_val, correct_val, risk_test, correct_test,
     return out
 
 def method_auc(risk_test, correct_test):
-    """风险分数对错误的判别 AUC（越高越好）。"""
+    """Discrimination AUC of a risk score against error (higher is better)."""
     err_t = (1 - correct_test).astype(int)
     if len(np.unique(err_t)) < 2: return np.nan
     return float(roc_auc_score(err_t, risk_test))
 
 def exp_D_all_methods(C, pred, y_np, data, test_mask, val_mask, t_edge=0.0, t_agg=0.0):
-    """所有方法（conflict / msp / entropy / mc_dropout / neighborhood）走同一协议。
+    """All methods (conflict / msp / entropy / mc_dropout / neighborhood) run under
+    one identical protocol.
 
-    统一用「预算协议」：按风险分排序、固定保留 cov 比例的节点。
-    同时给出 val 定阈值（无泄漏）与 test 定阈值（oracle 泄漏对照）两套数。
+    A single "budget protocol" is used: rank by risk score and keep a fixed cov
+    fraction of nodes.
+    Both the val-tuned (leak-free) and test-tuned (oracle leakage control) numbers
+    are reported.
     """
     correct_t = (pred["y_pred"][test_mask] == y_np[test_mask]).astype(float)
     correct_v = (pred["y_pred"][val_mask] == y_np[val_mask]).astype(float)
@@ -735,11 +783,11 @@ def exp_D_all_methods(C, pred, y_np, data, test_mask, val_mask, t_edge=0.0, t_ag
         "msp": (1.0 - pred["conf"][val_mask], 1.0 - pred["conf"][test_mask]),
         "entropy": (pred["entropy"][val_mask], pred["entropy"][test_mask]),
     }
-    # 邻域一致性基线（零成本，只用预测标签）
+    # neighbourhood-consistency baseline (zero cost, predicted labels only)
     nc = neighborhood_inconsistency(pred["y_pred"], pred["src"], pred["dst"], pred["deg"])
     methods["neighborhood"] = (nc[val_mask], nc[test_mask])
 
-    # MC-Dropout（同时记录真实耗时，Scalability 一节引用这个数）
+    # MC-Dropout (its true wall-clock time is recorded; cited in Scalability)
     mc_risk, t_mc = mc_dropout_risk(pred["model"], data)
     methods["mc_dropout"] = (mc_risk[val_mask], mc_risk[test_mask])
 
@@ -747,9 +795,10 @@ def exp_D_all_methods(C, pred, y_np, data, test_mask, val_mask, t_edge=0.0, t_ag
         results[name] = abstention_eval(r_v, correct_v, r_t, correct_t)
         aucs[name] = method_auc(r_t, correct_t)
 
-    # 融合审计分（数据集级选 λ）：这里只产出部件。
-    # λ 在 run_one_dataset 里用 5 个 seed 的验证集 AUC 平均曲线选择——
-    # 比 per-seed 各选各的稳定得多（小图 val 噪声会被平均掉），审计阶段仍 label-free。
+    # fused audit score (dataset-level lambda): only the components are produced here.
+    # Lambda is chosen in run_one_dataset from the mean val-AUC curves over 5 seeds --
+    # far more stable than choosing per seed (val noise on small graphs gets averaged
+    # out); the audit stage remains label-free.
     try:
         from scipy.stats import rankdata
         rc = rankdata(C) / len(C)
@@ -763,12 +812,13 @@ def exp_D_all_methods(C, pred, y_np, data, test_mask, val_mask, t_edge=0.0, t_ag
         print("  [warn] fused parts failed:", _e)
         aucs["fused_parts"] = None
 
-    # 冲突分全流程耗时：边特征/边分类器阶段(t_edge) + 节点级聚合阶段(t_agg)
+    # end-to-end conflict-score time: edge-feature/classifier stage (t_edge) +
+    # node-level aggregation stage (t_agg)
     t_conflict = float(t_edge) + float(t_agg)
     return results, aucs, t_mc, t_conflict
 
 def risk_coverage_curve(risk_test, correct_test, n_pts=10):
-    """按风险升序保留前 x 比例节点的覆盖-精度曲线（画图用）。"""
+    """Coverage-accuracy curve keeping the top x fraction of nodes by ascending risk (for plotting)."""
     order = np.argsort(risk_test)
     cum_correct = np.cumsum(correct_test[order])
     coverages = np.linspace(0.1, 1.0, n_pts)
@@ -779,7 +829,7 @@ def risk_coverage_curve(risk_test, correct_test, n_pts=10):
     return coverages, np.array(accs)
 
 # ============================================================
-# 绘图（1x4 诊断图，供 make_2x2.py 切分）
+# Plotting (1x4 diagnostic panels; split into 2x2 by make_figures.py)
 # ============================================================
 def plot_single_dataset(ds_name, res_out, save_dir="figures"):
     os.makedirs(save_dir, exist_ok=True)
@@ -811,7 +861,7 @@ def plot_single_dataset(ds_name, res_out, save_dir="figures"):
     for name in ["conflict", "msp", "entropy", "mc_dropout"]:
         cov, acc = res_out["rc_curves"][name]["cov"], res_out["rc_curves"][name]["acc"]
         ax.plot(cov, acc, 'o-', ms=3, color=colors[name], label=labels[name])
-        # 标出 val 调阈值协议在 80% 覆盖率下的实际工作点
+        # mark the actual operating point of the val-threshold protocol at 80% coverage
         op = res_out["abstention_mean"][name].get("0.8", None)
         if op is not None:
             ax.plot(op["cov_actual"], op["acc_val"], '*', ms=12, color=colors[name])
@@ -824,10 +874,10 @@ def plot_single_dataset(ds_name, res_out, save_dir="figures"):
     print(f"  [fig] {save_path}")
 
 # ============================================================
-# 曲线聚合工具
+# Curve-aggregation utilities
 # ============================================================
 def average_curves_on_targets(curve_lists, key):
-    """多条曲线按相同目标点取均值（缺失点忽略）。"""
+    """Average multiple curves at matched target points (missing points ignored)."""
     if not curve_lists: return []
     all_targets = sorted({round(r[key], 6) for run in curve_lists for r in run})
     out = []
@@ -845,7 +895,7 @@ def average_curves_on_targets(curve_lists, key):
     return out
 
 def interpolate_curves(curve_lists, key, grid):
-    """各 seed 的 p_n 目标不同，插值到公共网格后取均值。"""
+    """Per-seed p_n targets differ; interpolate onto a common grid and average."""
     acc = {g: [] for g in grid}
     for run in curve_lists:
         if not run: continue
@@ -859,7 +909,7 @@ def interpolate_curves(curve_lists, key, grid):
     return [{key: float(g), "dE": float(np.mean(v))} for g, v in acc.items() if v]
 
 # ============================================================
-# 单数据集单 seed
+# One dataset, one seed
 # ============================================================
 def run_one_seed(ds_name, seed, device="cpu", edge_mode="sup",
                  edge_space="emb", edge_feat="full"):
@@ -875,26 +925,36 @@ def run_one_seed(ds_name, seed, device="cpu", edge_mode="sup",
     cbar_chosen, mech_chosen = float("nan"), ""
     p_e_obs, q_hat = float("nan"), float("nan")
     if CONFLICT_MODE in ("curate", "curate2") and pred.get("p_uv") is not None:
-        # 【零选择部署模式】面向「模型训好、来了新图、没有 val/test 标签」的场景。
-        # 与前几版的根本区别：没有候选集、没有 val 选择、没有守卫阈值。
-        #   1) 基冲突固定为 soft：c_uv = I(same)(1−p_uv) + I(diff)p_uv
-        #      它是硬指标的后验期望，只去掉伯努利抽样噪声，不引入新信息；
-        #   2) 聚合固定为 deg：C(v)=Σ_u c_uv/d_v，值域 [0,1]，含义是"邻居冲突比例"，
-        #      量纲与论文 Eq.(expect_cv) 一致，边界 h*=1/C 可直接照搬；
-        #   3) 组合固定为 C̃(v)=C(v)·(1−M(v))，M 为邻居边的平均冲突（本底）。
-        #      β=1 写死，不做选择：M 小时式子≈C（同配图自动退化为平滑），
-        #      M 大时自动压掉普遍存在的冲突、只留超出本底的部分（异配图自动转对比）。
+        # [zero-selection deployment mode] for the scenario "model trained, new graph
+        # arrives, no val/test labels available".
+        # The fundamental difference from earlier versions: no candidate set, no
+        # val-based selection, no guard threshold.
+        #   1) base conflict fixed to soft: c_uv = I(same)*(1-p_uv) + I(diff)*p_uv;
+        #      the posterior expectation of the hard indicator -- it removes only
+        #      Bernoulli sampling noise and introduces no new information;
+        #   2) aggregation fixed to deg: C(v)=sum_u c_uv/d_v, range [0,1], the
+        #      "neighbour conflict fraction";
+        #      the dimension matches the paper's Eq. (expect_cv) and the boundary
+        #      h*=1/C carries over directly;
+        #   3) combination fixed to Ctilde(v)=C(v)*(1-M(v)), M the mean conflict of
+        #      neighbouring edges (the background).
+        #      beta=1 is hard-coded, nothing is selected: when M is small the expression
+        #      is ~C (automatic smoothing on homophilous graphs);
+        #      when M is large it suppresses the pervasive conflict and keeps only the
+        #      excess over the background (automatic contrast on heterophilous graphs).
         src, dst, deg = pred["src"], pred["dst"], pred["deg"]
         same = (pred["y_pred"][src] == pred["y_pred"][dst]).astype(np.float32)
         p = np.asarray(pred["p_uv"], np.float32)
         c_e = (same * (1.0 - p) + (1.0 - same) * p).astype(np.float32)
         t0 = time.perf_counter()
         if CONFLICT_MODE == "curate2":
-            # 变体：聚合改为 sym（邻居证据按 1/√d_u 打折），组合改为算术平滑。
-            # 公式仍然唯一，只是两个算子的选择不同；不读 val、不读标签。
-            # 消融开关（默认即主方法）：
-            #   CF_AGG=sym|mean      节点级聚合算子，mean 退回度归一化
-            #   CF_COMBINE=avg|none  none 表示丢掉邻居本底项，只用 C_self
+            # Variant: sym aggregation (neighbour evidence discounted by 1/sqrt(d_u))
+            # and arithmetic smoothing as the combination. The formula is still unique;
+            # only the choice of two operators differs. No val, no labels.
+            # Ablation switches (defaults are the main method):
+            #   CF_AGG=sym|mean      node-level aggregation operator; mean falls back to
+            #                        degree normalisation
+            #   CF_COMBINE=avg|none  none drops the neighbour background and uses C_self only
             C_self, C_nbr = neighbor_conflict_pair(c_e, src, dst, deg, N, agg=CURATE_AGG)
             if CURATE_COMBINE == "none":
                 C_metric = C_self.astype(np.float32)
@@ -907,24 +967,32 @@ def run_one_seed(ds_name, seed, device="cpu", edge_mode="sup",
         chosen_mode = CONFLICT_MODE
         err = (pred["y_pred"] != y_np).astype(int)
 
-        # ---- 现场诊断量：全部只用模型输出与图结构，审计期不读任何标签 ----
-        # p_e 按论文 §III 的定义取「预测器标记边一致的概率」，不是准确率。
+        # ---- on-the-spot diagnostics: model outputs and graph structure only, ----
+        # ---- no labels read at audit time ----
+        # p_e is, per Sec. III of the paper, "the probability that the predictor calls
+        # an edge consistent" -- not an accuracy.
         p_e_obs = float(pred["e_pred"].mean())
         cbar_chosen = float(C_self.mean())
-        # 恒等式（逐边精确，无需 ê 与同类指示独立）：
+        # identity (exact edge by edge; no independence assumption between ehat and
+        # the same-class indicator):
         #   C̄ = q + p_e − 2·E[I·ê]  ⇒  q = C̄ − p_e + 2·s
         s_obs = float((same * pred["e_pred"]).mean())
         q_hat = cbar_chosen - p_e_obs + 2.0 * s_obs
-        # 边界判断：q̂ 与 1/C 比较决定「高冲突 = 错分」还是「高冲突 = 局部稀有」。
-        # 仅当 p_e > 1/2 时该判据有效（论文 §III 已声明此前提）。
+        # boundary decision: comparing qhat with 1/C decides whether "high conflict =
+        # misclassified" or "high conflict = locally rare".
+        # The criterion is valid only when p_e > 1/2 (stated in Sec. III).
         mech_chosen = "trust" if (p_e_obs > 0.5 and q_hat > 1.0 / C_num) else "unreliable"
     elif CONFLICT_MODE == "nbr3" and pred.get("p_uv") is not None:
-        # 【邻居冲突的第三种用法：机制由冲突场自身的平均水平决定】
-        # 只读冲突值，不用 h、不用标签、不做逐数据集调参：
-        #   C̄ ≤ τ → 冲突稀疏，邻居冲突主要是噪声 → 平滑 C̃=(C+M)/2
-        #   C̄ > τ → 冲突遍地，邻居冲突是"本底"     → 对比 C̃=C·(1−M)
-        # 唯一用 val 决定的是基冲突值取 hard 还是 soft（与原协议一致），
-        # 外加 0.005 的守卫：gate 后的分数若不如 {hard,soft} 的 C，就退回 C。
+        # [third use of neighbour conflict: mechanism set by the conflict field's own mean level]
+        # reads only conflict values: no h, no labels, no per-dataset tuning:
+        #   Cbar <= tau -> conflict sparse, neighbour conflict mostly noise ->
+        #                  smoothing Ctilde=(C+M)/2
+        #   Cbar >  tau -> conflict everywhere, neighbour conflict is the background ->
+        #                  contrast Ctilde=C*(1-M)
+        # The only val-driven choice is hard vs soft base conflict (as in the original
+        # protocol), plus a 0.005 guard: if the gated score is worse than the plain C
+        # of {hard, soft}, fall back to C.
+        # plus a 0.005 guard: if the gated score is worse than the plain C of {hard, soft}, fall back to C.
         args = (pred["y_pred"], pred["e_pred"], pred["src"], pred["dst"], pred["deg"], y_np)
         cands, t_agg = {}, 0.0
         cbar_chosen, mech_chosen = float("nan"), ""
@@ -937,7 +1005,7 @@ def run_one_seed(ds_name, seed, device="cpu", edge_mode="sup",
             C_self, C_nbr = neighbor_conflict_pair(c_e, pred["src"], pred["dst"], pred["deg"], N,
                                                    inv_denom=inv_denom)
             t_agg += time.perf_counter() - t0
-            cbar = float(C_self.mean())          # 平均冲突水平，审计期可直接观测
+            cbar = float(C_self.mean())          # mean conflict level, observable at audit time
             mech = "smooth" if cbar <= NBR_TAU else "contrast"
             if mech == "smooth":
                 s = 0.5 * (C_self + C_nbr)
@@ -952,11 +1020,13 @@ def run_one_seed(ds_name, seed, device="cpu", edge_mode="sup",
         if 0 < int(ev.sum()) < len(ev):
             try:
                 scores = {k: float(roc_auc_score(ev, v[val_mask])) for k, v in cands.items()}
-                # 机制由 C̄ 固定，不做逐数据集挑机制；val 只做两件事：
-                # (1) 基冲突值 hard/soft 二选一（与原协议一致）；
-                # (2) 邻居项在 val 上确有增益（≥NBR_MARGIN）才启用，否则退回 C。
-                # 第 (2) 条是「开关」不是「选择」：全数据集共用同一阈值，
-                # 不引入任何额外信息（不看 h、不看标签、不看图规模）。
+                # the mechanism is fixed by Cbar, not chosen per dataset; val does two
+                # things only:
+                # (1) pick hard vs soft base conflict (as in the original protocol);
+                # (2) enable the neighbour term only if it genuinely helps on val
+                #     (gain >= NBR_MARGIN), otherwise fall back to C.
+                # (2) is a switch, not a selection: one threshold shared by all datasets,
+                # no extra information (no h, no labels, no graph size).
                 gated = max((k for k in scores if "|C" not in k), key=lambda k: scores[k])
                 ref = max(("hard|C", "soft|C"), key=lambda k: scores[k])
                 chosen_mode = gated if scores[gated] > scores[ref] + NBR_MARGIN else ref
@@ -968,16 +1038,20 @@ def run_one_seed(ds_name, seed, device="cpu", edge_mode="sup",
         base_chosen = chosen_mode.split("|")[0]
         cbar_chosen, mech_chosen = info[base_chosen]
     elif CONFLICT_MODE == "nbr2" and pred.get("p_uv") is not None:
-        # 【邻居冲突的第二种用法：换机制而不是混数值】
-        # 对每种基冲突值 c_e，先算一次邻居本底 M(v)（=边的邻居平均冲突的节点级聚合），
-        # 然后并行给出三类判决：
-        #   C            —— 原方法（自己边上的冲突）
-        #   lin+0.5      —— 平滑：把邻居冲突当降噪用的第二观测
-        #   prod{b}      —— 乘性对比：C·(1−b·M)，把 M 当"本底冲突"，
-        #                   只有"高出本底"的部分才算可疑（异配图上冲突遍地，这条最关键）
-        #   max          —— 冲突稀疏时的最坏邻边
-        # 全部由 (C_self, M) 两个向量 O(N) 组合得到，边只走 2 次 bincount，扫描不加成本。
-        # 选优仍只看 val AUC，且提升不足 NBR_MARGIN 就退回 {hard,soft} 的 C。
+        # [second use of neighbour conflict: switch mechanisms instead of mixing scores]
+        # For each base conflict c_e, compute the neighbour background M(v) once (node-level
+        # aggregation of the mean conflict of neighbouring edges),
+        # then produce three verdicts in parallel:
+        #   C            -- the original method (conflict on own edges)
+        #   lin+0.5      -- smoothing: neighbour conflict as a second observation for denoising
+        #   prod{b}      -- multiplicative contrast: C*(1-b*M), treating M as the background
+        #                   conflict; only the part above the background is suspicious
+        #                   (the key regime when conflict is pervasive on heterophilous graphs)
+        #   max          -- worst neighbouring edge when conflict is sparse
+        # All are O(N) combinations of the two vectors (C_self, M); edges are walked only
+        # by 2 bincounts, so sweeping adds no cost.
+        # Selection still uses val AUC only, and falls back to the C of {hard, soft}
+        # when the gain is below NBR_MARGIN.
         args = (pred["y_pred"], pred["e_pred"], pred["src"], pred["dst"], pred["deg"], y_np)
         cands, t_agg = {}, 0.0
         inv_denom = neighbor_inv_denom(pred["deg"], pred["src"], pred["dst"])
@@ -1009,14 +1083,17 @@ def run_one_seed(ds_name, seed, device="cpu", edge_mode="sup",
             except ValueError:
                 pass
     elif CONFLICT_MODE == "nbr6" and pred.get("p_uv") is not None:
-        # 【nbr2 + 只改节点级聚合算子：不用模型中间结果、不用原始特征、不碰分类置信度】
-        # 候选 = {hard, soft} × {deg, sym} × {C, lin, prod×3, max}
-        #   deg: C(v) = Σ_u c_uv / d_v                                   （原方法，算术平均）
-        #   sym: C(v) = Σ_u c_uv / (d_v · √d_u)                          （邻居证据按 √d_u 打折）
-        # sym 的作用是压住 hub 邻居：高度数邻居与谁冲突都不稀奇，它对每个邻居的证据强度
-        # 应按 1/√d_u 削弱；自己这一侧仍除以 d_v，保证量纲是"平均冲突"而不是总和。
-        # tolokers/squirrel/wisconsin/cornell/texas 这类低度、度分布极偏的图上 sym 有效，
-        # 其余图在 val 上会选回 deg，结果不变。
+        # [nbr2 + node-level aggregation operator only: no model internals, no raw features, no classification confidence]
+        # candidates = {hard, soft} x {deg, sym} x {C, lin, prod x 3, max}
+        #   deg: C(v) = sum_u c_uv / d_v                        (original, arithmetic mean)
+        #   sym: C(v) = sum_u c_uv / (d_v * sqrt(d_u))          (neighbour evidence discounted by 1/sqrt(d_u))
+        # sym tames hub neighbours: a high-degree neighbour conflicts with someone no matter
+        # what, so its evidence per neighbour is discounted by
+        # 1/sqrt(d_u); the self side still divides by d_v, keeping the dimension "mean
+        # conflict" rather than a sum.
+        # sym helps on low-degree graphs with skewed degree distributions
+        # (tolokers / squirrel / wisconsin / cornell / texas); other graphs select back
+        # to deg on val, with no change in results.
         src, dst, deg = pred["src"], pred["dst"], pred["deg"]
         same = (pred["y_pred"][src] == pred["y_pred"][dst]).astype(np.float32)
         p = np.asarray(pred["p_uv"], np.float32)
@@ -1054,12 +1131,17 @@ def run_one_seed(ds_name, seed, device="cpu", edge_mode="sup",
             except ValueError:
                 pass
     elif CONFLICT_MODE == "nbr5" and pred.get("p_uv") is not None:
-        # 【nbr2 + 冲突侧两处改动，仍不引入任何分类置信度（不碰 MSP）】
-        # (1) 聚合算子：deg（除以度）与 sym（D^{-1/2}AD^{-1/2}）在 val 上二选一。
-        #     同配高维图上"除以度"更稳，低度/异配图上"对称"更稳，谁也压不过谁。
-        # (2) 基冲突值加上「模型中间结果」：把边判定概率换成 (1+cos)/2，
-        #     cos 取 GCN 第一层之后的隐藏表征 z —— 不需要拟合，仍是"两端判定是否一致"。
-        # 守卫仍以原方法（deg 聚合的 C）为参照，提升不足 NBR_MARGIN 就退回。
+        # [nbr2 + two conflict-side changes, still introducing no classification confidence (MSP untouched)]
+        # (1) aggregation operator: deg (divide by degree) vs sym (D^{-1/2} A D^{-1/2}),
+        #     chosen on val.
+        #     "Divide by degree" is more robust on homophilous high-dim graphs,
+        #     "symmetric" on low-degree / heterophilous ones; neither dominates.
+        # (2) base conflict extended with model internals: the edge-verdict probability
+        #     becomes (1+cos)/2
+        #     with cos from the hidden representation z after the first GCN layer -- no
+        #     fitting, still "do the two endpoints agree".
+        # The guard still references the original method (deg-aggregated C); fall back
+        # when the gain is below NBR_MARGIN.
         src, dst, deg = pred["src"], pred["dst"], pred["deg"]
         same = (pred["y_pred"][src] == pred["y_pred"][dst]).astype(np.float32)
         p = np.asarray(pred["p_uv"], np.float32)
@@ -1104,11 +1186,14 @@ def run_one_seed(ds_name, seed, device="cpu", edge_mode="sup",
             except ValueError:
                 pass
     elif CONFLICT_MODE == "nbr4" and pred.get("p_uv") is not None:
-        # 【nbr2 的两处冲突侧改动，仍然不用任何分类置信度（不碰 MSP）】
-        # (1) 聚合算子：对称归一化 D^{-1/2}AD^{-1/2}（C 与邻居本底 M 用同一算子）
-        # (2) 基冲突值扩到「模型中间结果」与「原始特征」：
-        #     把边判定概率换成 (1+cos)/2 —— 隐藏层 z 的余弦、输入特征 x 的余弦。
-        #     这两个量不需要拟合，仍是"冲突"族（两端判定是否一致），只是换度量空间。
+        # [two more conflict-side changes of nbr2, still using no classification confidence (MSP untouched)]
+        # (1) aggregation operator: symmetric normalisation D^{-1/2} A D^{-1/2} (the same
+        #     operator for C and the neighbour background M)
+        # (2) base conflict extended to model internals and raw features:
+        #     the edge-verdict probability becomes (1+cos)/2 -- the cosine of the hidden z
+        #     and of the input features x.
+        #     Neither needs fitting; both remain in the "conflict" family (do the endpoints
+        #     agree), only the metric space changes.
         src, dst, deg = pred["src"], pred["dst"], pred["deg"]
         same = (pred["y_pred"][src] == pred["y_pred"][dst]).astype(np.float32)
         p = np.asarray(pred["p_uv"], np.float32)
@@ -1122,7 +1207,8 @@ def run_one_seed(ds_name, seed, device="cpu", edge_mode="sup",
             "emb": (same * (1 - s_emb) + (1 - same) * s_emb).astype(np.float32),
         }
         if data.num_features * len(src) <= 4e8:
-            # 高维大图（Squirrel/Pubmed）跳过原始空间：O(|E|·d) 会破坏复杂度声明
+            # skip the raw space on high-dim large graphs (Squirrel/Pubmed): O(|E|*d) would
+            # break the complexity claim
             Xnp = data.x.cpu().numpy().astype(np.float32)
             s_raw = np.clip((_edge_cos(Xnp, src, dst) + 1.0) * 0.5, 0.0, 1.0).astype(np.float32)
             bases["raw"] = (same * (1 - s_raw) + (1 - same) * s_raw).astype(np.float32)
@@ -1156,10 +1242,11 @@ def run_one_seed(ds_name, seed, device="cpu", edge_mode="sup",
             except ValueError:
                 pass
     elif CONFLICT_MODE == "sym" and pred.get("p_uv") is not None:
-        # 【只换聚合算子：对称归一化代替除以度】
-        # C(v) = Σ_{u∈N(v)} c_uv / sqrt(d_u d_v)，即 GCN 自己的 D^{-1/2}AD^{-1/2}。
-        # 不引入新的选择维度：base 仍按 val AUC 在 hard/soft 之间二选一（与原协议一致），
-        # 没有逐数据集挑机制，因此自由度与原方法相同。
+        # [aggregation operator only: symmetric normalisation instead of degree division]
+        # C(v) = sum_{u in N(v)} c_uv / sqrt(d_u d_v), i.e. the GCN's own D^{-1/2} A D^{-1/2}.
+        # No new selection dimension: base conflict is still hard-vs-soft chosen on val AUC
+        # (as in the original protocol);
+        # no per-dataset mechanism choice, so the degrees of freedom match the original method.
         cands, t_agg = {}, 0.0
         for base in ("hard", "soft"):
             c_e = _edge_disagree(pred["y_pred"], pred["e_pred"], pred["src"], pred["dst"],
@@ -1177,12 +1264,16 @@ def run_one_seed(ds_name, seed, device="cpu", edge_mode="sup",
                 pass
         C_metric, chosen_mode = cands[chosen], f"{chosen}|sym"
     elif CONFLICT_MODE in ("nbr", "auto") and pred.get("p_uv") is not None:
-        # 候选集 = {hard, soft} × {α=0} ∪ {α∈NBR_ALPHAS}，外加 soft_max（α=0）。
-        # 因为 C(α)=(1−α)C_self+α·C_nbr 对 α 线性，每种基冲突值只走 2 次 bincount
-        # 拿到 C_self / C_nbr，整族 α 是 O(N) 混合，扫参数不重复走边。
-        # 选择协议与阈值调优一致：只看 val AUC，1 次选择、不碰 test；
-        # 若最优候选相对 {hard, soft} 的提升不足 NBR_MARGIN，则退回，
-        # 保证「在现有效果的前提下」不因选择噪声变差。
+        # candidate set = {hard, soft} x {alpha=0} union {alpha in NBR_ALPHAS}, plus
+        # soft_max (alpha=0).
+        # Since C(alpha)=(1-alpha)C_self+alpha*C_nbr is linear in alpha, each base conflict
+        # needs only 2 bincounts
+        # to obtain C_self / C_nbr; the whole alpha family is an O(N) blend -- sweeping
+        # never re-walks edges.
+        # The selection protocol matches threshold tuning: val AUC only, one selection,
+        # test never touched;
+        # if the best candidate beats {hard, soft} by less than NBR_MARGIN, fall back --
+        # guaranteeing no degradation from selection noise.
         args = (pred["y_pred"], pred["e_pred"], pred["src"], pred["dst"], pred["deg"], y_np)
         cands, t_agg = {}, 0.0
         inv_denom = neighbor_inv_denom(pred["deg"], pred["src"], pred["dst"])
@@ -1230,10 +1321,10 @@ def run_one_seed(ds_name, seed, device="cpu", edge_mode="sup",
     resB = exp_B_scan_pe(pred, y_np, test_mask)
     resC = exp_C_scan_pn(pred, y_np, test_mask, C_num=C_num)
 
-    # 【① 真实 AUC】test 上 C 对 node error 的 AUC
+    # [true AUC] AUC of C against node error on test
     auc_natural = method_auc(C_metric[test_mask], (pred["y_pred"][test_mask] == y_np[test_mask]).astype(float))
 
-    # 【②】abstention：全部方法走同一协议
+    # [abstention] all methods under one identical protocol
     abst, abst_aucs, t_mc, t_conflict = exp_D_all_methods(
         C_metric, pred, y_np, data, test_mask, val_mask,
         t_edge=pred.get("t_edge", 0.0), t_agg=t_agg)
@@ -1271,7 +1362,7 @@ def run_one_seed(ds_name, seed, device="cpu", edge_mode="sup",
     return out, pred, C_metric, y_np, test_mask, data
 
 # ============================================================
-# 单数据集 5 seed 汇总
+# One dataset, 5-seed aggregation
 # ============================================================
 SCALAR_KEYS = ["h", "p_e_train", "p_e_val", "p_e_test", "p_e_obs", "q_hat", "boundary",
                "skill_gain_val", "skill_gain",
@@ -1298,7 +1389,8 @@ def run_one_dataset(ds_name, outdir="results_v2", device="cpu", edge_mode="sup",
         print(f"    seed {seed}: base={out['base_acc']:.3f} acc@80(val)={out['acc_at_80_val']:.3f} "
               f"AUC={out['AUC']:.3f} p_e_test={out['p_e_test']:.3f}")
 
-    # ---- 融合审计分：数据集级 λ（5 个 seed 的 val AUC 曲线平均后选择，小图更稳）----
+    # ---- fused audit score: dataset-level lambda (selected on the mean val-AUC curves
+    # over 5 seeds; more stable on small graphs) ----
     lams = np.linspace(0, 1, 21)
     if all(p is not None for p in seed_parts):
         parts_conv = []
@@ -1313,7 +1405,8 @@ def run_one_dataset(ds_name, outdir="results_v2", device="cpu", edge_mode="sup",
         val_mean = np.nanmean(val_mat, axis=0)
         i_best = int(np.nanargmax(val_mean))
         best_lam = float(lams[i_best])
-        # 无害守卫：最优 λ 的平均 val AUC 没有明显超过纯置信项就退回 λ=1
+        # harmless guard: fall back to lambda=1 when the best lambda does not clearly
+        # beat the pure confidence term on mean val AUC
         a_conf = np.nanmean([method_auc(p["rm_v"], p["cor_v"]) for p in parts_conv])
         if not np.isnan(a_conf) and val_mean[i_best] < a_conf + 0.005:
             best_lam = 1.0
@@ -1351,7 +1444,8 @@ def run_one_dataset(ds_name, outdir="results_v2", device="cpu", edge_mode="sup",
                 for kk in ["acc_val", "cov_actual", "acc_oracle"]
             }
 
-    # 覆盖-精度曲线（取 seed 0 的排序，代表图；工作点用均值）
+    # coverage-accuracy curves (seed 0 ordering, representative figure; operating points
+    # averaged over seeds)
     correct_t = (first_pred["y_pred"][first_test] == first_y[first_test]).astype(float)
     rc_curves = {}
     conf_t = first_pred["conf"][first_test]; ent_t = first_pred["entropy"][first_test]
@@ -1400,7 +1494,8 @@ def run_one_dataset(ds_name, outdir="results_v2", device="cpu", edge_mode="sup",
         "t_fit": mean["t_fit"], "t_embed": mean["t_embed"], "t_sim": mean["t_sim"],
         "t_jac": mean["t_jac"], "t_pred": mean["t_pred"],
         "edge_mode": edge_mode, "edge_space": edge_space, "edge_feat": edge_feat,
-        # 边预测器在多少个 seed 上真正拟合成功（<1 表示该数据集上会退化，p_e 留 NaN）
+        # on how many seeds the edge predictor truly fit (<1 means it degenerates on this
+        # dataset and p_e stays NaN)
         "edge_fit_rate": float(np.mean([bool(o["edge_fit_ok"]) for o in seed_outs])),
     }
     return summary, res_out
@@ -1415,21 +1510,21 @@ if __name__ == "__main__":
     parser.add_argument("--outdir", type=str, default="results_v2")
     parser.add_argument("--device", type=str, default="cuda" if torch.cuda.is_available() else "cpu")
     parser.add_argument("--edge-mode", type=str, default="sup", choices=["sup", "unsup"],
-                        help="sup: 训练边标签拟合的 LR（主配置）; unsup: 纯余弦阈值（Ablation #1）")
+                        help="sup: LR fitted on training-edge labels (main); unsup: pure cosine threshold (Ablation #1)")
     parser.add_argument("--edge-space", type=str, default="auto", choices=["auto", "emb", "raw"],
-                        help="auto: d>64 用 64 维 embedding，否则用原始特征（默认）; "
-                             "emb: 强制 embedding; raw: 强制原始特征（旧实现 O(|E|·d)）")
+                        help="auto: 64-dim embedding when d>64, else raw features (default); "
+                             "emb: force embedding; raw: force raw features (legacy O(|E|*d))")
     parser.add_argument("--edge-feat", type=str, default="full", choices=["cos", "cos_deg", "full", "pred"],
-                        help="边分类器输入特征: cos / cos+度数差 / 再加二值重叠度")
+                        help="edge-classifier features: cos / cos+degree diff / plus binary overlap")
     args = parser.parse_args()
 
     ds_names = [d.strip() for d in args.datasets.split(",")]
     os.makedirs(args.outdir, exist_ok=True)
     summary_rows, detailed = [], {}
 
-    print(f"\n{'='*80}\n实验：{len(ds_names)} 数据集 x {len(SEEDS)} seeds | "
+    print(f"\n{'='*80}\nExperiment: {len(ds_names)} datasets x {len(SEEDS)} seeds | "
           f"edge_mode={args.edge_mode} edge_space={args.edge_space} "
-          f"edge_feat={args.edge_feat} | MC-Dropout {N_DROPOUT_PASSES} 次 | "
+          f"edge_feat={args.edge_feat} | MC-Dropout {N_DROPOUT_PASSES} passes | "
           f"device={args.device}\n{'='*80}\n")
 
     for name in ds_names:
@@ -1442,10 +1537,10 @@ if __name__ == "__main__":
                                                edge_feat=args.edge_feat)
             detailed[name] = res_out
             summary_rows.append(summary)
-            print(f"[{time.strftime('%H:%M:%S')}] {name} 完成，耗时 {time.time()-t0:.1f}s\n")
+            print(f"[{time.strftime('%H:%M:%S')}] {name} done in {time.time()-t0:.1f}s\n")
         except Exception as e:
             import traceback
-            print(f"\n[错误] {name} 运行失败: {e}")
+            print(f"\n[error] {name} failed: {e}")
             traceback.print_exc()
             print("\n")
 
@@ -1467,14 +1562,14 @@ if __name__ == "__main__":
     df_out["base_acc_pm"] = df.apply(lambda r: f"{r['base_acc']:.3f}±{r['base_acc_std']:.3f}", axis=1)
     df_out["acc80_pm"] = df.apply(lambda r: f"{r['acc_at_80_val']:.3f}±{r['acc_at_80_val_std']:.3f}", axis=1)
 
-    print("\n" + "="*120 + "\n v2 汇总表（val 调阈值协议 + 真实 AUC + test 边 p_e）\n" + "="*120)
+    print("\n" + "="*120 + "\n v2 summary (val-tuned thresholds + true AUC + test-edge p_e)\n" + "="*120)
     show_cols = ["dataset", "h", "p_e_test", "skill_gain", "AUC", "auc_msp", "E_C",
                  "base_acc_pm", "acc80_pm", "acc_at_80_msp", "acc_at_80_nc",
                  "acc_at_80_mc", "t_conflict", "t_mc_dropout", "t_fit"]
     try: print(df_out[show_cols].to_markdown(index=False, tablefmt="grid"))
     except: print(df_out[show_cols].to_string(index=False))
 
-    print("\n" + "="*80 + "\n 雷达图坐标 (E[C], base_acc) mean±std：\n" + "="*80)
+    print("\n" + "="*80 + "\n Radar coordinates (E[C], base_acc) mean+-std:\n" + "="*80)
     for r in summary_rows:
         print(f"({r['E_C']:.3f}, {r['base_acc']:.3f}) pm ({r['E_C']:.3f},{r['base_acc_std']:.3f}) % {r['dataset']}")
 

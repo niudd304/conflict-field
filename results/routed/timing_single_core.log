@@ -1,0 +1,18 @@
+# Single-core audit timings (median wall-clock, one CPU core, single-threaded).
+# t_audit covers the edge pass, embedding extraction where applicable, and the
+# second member's forward pass; t_mc covers 20 stochastic MC-Dropout passes.
+# Small graphs measured by src/timing_clean.py; Penn94 and genius measured with
+# the same protocol on GPU-trained models (audit stage still CPU-only).
+cora                  t_audit=    12.6ms t_mc20=      116ms speedup=  9.2x
+citeseer              t_audit=    33.3ms t_mc20=      249ms speedup=  7.5x
+pubmed                t_audit=   117.6ms t_mc20=      935ms speedup=  8.0x
+chameleon_filtered    t_audit=    11.6ms t_mc20=       87ms speedup=  7.5x
+squirrel_filtered     t_audit=    54.3ms t_mc20=      419ms speedup=  7.7x
+texas                 t_audit=     1.8ms t_mc20=       12ms speedup=  6.6x
+cornell               t_audit=     1.6ms t_mc20=       13ms speedup=  7.8x
+wisconsin             t_audit=     1.8ms t_mc20=       14ms speedup=  8.0x
+actor                 t_audit=    40.3ms t_mc20=      366ms speedup=  9.1x
+tolokers              t_audit=   557.1ms t_mc20=     7906ms speedup= 14.2x
+amazon_ratings        t_audit=   269.2ms t_mc20=     1895ms speedup=  7.0x
+genius (421,961 N)    t_audit=  1724.0ms t_mc20=    22929ms speedup= 13.3x
+penn94 (41,487 N)     t_audit=  4016.0ms t_mc20=    25007ms speedup=  6.2x

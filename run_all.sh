@@ -64,6 +64,14 @@ else
   echo "== large-scale skipped (set CF_EXT_ROOT to enable) =="
 fi
 
+# [9] Routed audit (the paper's final method): both evidence sources computed
+#     per run, channel selected by the routing rule 0.5 < p_e_obs < 1.0.
+#     Produces results/routed/final_table.json (Table I of the final paper).
+RDS="$DS"
+if [ -n "${CF_EXT_ROOT:-}" ]; then RDS="$DS,genius,penn94"; fi
+echo "== routed audit =="
+env CF_CONFLICT_MODE=curate2 $PY src/run_routed.py --datasets "$RDS" --seeds 0,1,2,3,4
+
 # Optional: restack the 1x4 diagnostic figures into the paper's 2x2 panels.
 # for ds in cora squirrel_filtered; do
 #   $PY src/make_figures.py "results/main/figures/${ds}_conflict.png" "${ds}_conflict_2x2.png"

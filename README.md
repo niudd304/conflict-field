@@ -1,7 +1,7 @@
 # Conflict Field — Artifact
 
 Reference implementation and released experimental results for
-*Conflict Field: Label-Free Graph Data Quality Auditing via Node–Edge Consistency*.
+*Conflict Field: A Label-Free Graph Data-Quality Audit with Two Evidence Sources*.
 
 The repository contains the final code (single driver + data preparation +
 ablation utilities) and the complete outputs of every experiment reported in
@@ -17,25 +17,37 @@ diagnostic figures.
 ├── run_all.sh              every command that backs the paper, in order
 ├── requirements.txt
 ├── src/
-│   ├── run_main.py         main experiments: Tables I–II, verdict, diagnostic figures
+│   ├── run_main.py         edge-conflict channel: ablations, verdict, figures
+│   ├── run_routed.py       the paper's final method: both channels + routing rule
 │   ├── run_ablation.py     synthetic homophily sweep, GNN-depth sweep
-│   ├── prepare_data.py     downloads and lays out the 11 benchmarks
+│   ├── prepare_data.py     downloads and lays out the 11 standard benchmarks
 │   └── make_figures.py     restacks 1×4 diagnostic panels into the paper's 2×2 format
 └── results/                released outputs of the paper's runs
-    ├── main/                              main method (Tables I–II, verdict)
+    ├── routed/                           the routed audit (Tables I–II of the paper)
+    ├── main/                             edge-conflict channel alone (ablation reference)
     ├── ablation/
-    │   ├── binary_deg/                    Table III row 1: binary edge verdict
-    │   ├── soft_deg/                      Table III row 2: + soft expectation
-    │   ├── soft_sym/                      Table III row 3: + symmetric aggregation
-    │   ├── soft_deg_background/           2×2 grid completion (not in Table III)
-    │   ├── label_free_scorer/             Table III: label-free edge scorer
-    │   ├── val_candidate_selection/       Table III: validation-tuned selection
-    │   ├── synthetic_sweep.json           synthetic homophily control
-    │   └── depth.json                     GNN-depth control
-    └── large_scale/                       Penn94 + genius (Scalability section)
+    │   ├── binary_deg/                   score-operator ablation row 1: binary edge verdict
+    │   ├── soft_deg/                     row 2: + soft expectation
+    │   ├── soft_sym/                     row 3: + symmetric aggregation
+    │   ├── soft_deg_background/          2×2 grid completion (not in the ablation table)
+    │   ├── label_free_scorer/            ablation: label-free edge scorer
+    │   ├── val_candidate_selection/      ablation: validation-tuned selection
+    │   ├── synthetic_sweep.json          synthetic homophily control
+    │   └── depth.json                    GNN-depth control
+    └── large_scale/                      Penn94 + genius, edge channel (Scalability section)
 ```
 
-Each experiment directory contains:
+`results/routed/` contains:
+
+| file | contents |
+|---|---|
+| `final_table.json` | 13 benchmarks × 5 seeds; per-seed AUC of every channel (routed, edge field, mdis, MSP, entropy, NC, MC-Dropout), routing decision, `p_e_obs`, verdict |
+| `abstain_cost.json` | per-seed Acc@80 % for all methods + per-graph forward-pass timings |
+| `summary.csv` | one row per dataset: routing decision, channel AUCs, mean±std |
+| `timing_single_core.log` | single-core audit timings, all 13 benchmarks |
+| `final_table.log` | per-dataset console summary of the released run |
+
+Each other experiment directory contains:
 
 | file | contents |
 |---|---|
@@ -98,13 +110,17 @@ Both roots of the standard suite can be redirected with `CF_HETERO_ROOT` and
 ## 4. Quick start
 
 ```bash
-# Full reproduction of every table (~25 min on CPU, 11 graphs × 5 seeds):
+# Full reproduction of every table (~30 min on CPU, 11 graphs × 5 seeds):
 bash run_all.sh
 
 # Wiring check only (~2 min, 3 graphs):
 bash run_all.sh quick
 
-# Main configuration only:
+# The paper's final method (both evidence sources + routing, 13 benchmarks
+# when CF_EXT_ROOT holds the two large graphs):
+python src/run_routed.py --seeds 0,1,2,3,4
+
+# Edge-conflict channel only (ablation reference):
 CF_CONFLICT_MODE=curate2 python src/run_main.py --outdir results/main
 ```
 
@@ -159,10 +175,30 @@ verdict = Trust  if (p_e > 0.5 and q̂ > 1/C) else Unreliable
 The identity is exact edge by edge and does not assume independence between the
 edge predictor and the same-class indicator.
 
-**Degenerate case.** With `--edge-mode unsup` the scorer is a cosine threshold
-with `p_uv = (cos+1)/2`, whose mean is 0.85–0.98 on every graph in the suite.
-Every edge is then called consistent, `ê ≡ 1`, and `C(v) ≡ 1 − NC(v)`. The score
-collapses onto neighbourhood consistency; Table III quantifies what that costs.
+**Degenerate case.** On graphs where the training split contains edges of a
+single class the fitted edge scorer collapses to a constant and `p_e_obs` sits
+at 0 or 1; the edge field then degenerates (on `--edge-mode unsup` it collapses
+onto neighbourhood consistency outright). The routing rule below is what keeps
+the audit usable there.
+
+**Step 5 — the routing rule (the paper's final method, `src/run_routed.py`).**
+The edge field is a regime-specific instrument, and the regime is set by
+`p_e_obs`: above ½ the derivative `∂E[C]/∂q^κ = 1 − 2p_e` flips sign and the
+field degenerates into an agreement counter. So the audit pairs it with a
+second evidence source — the disagreement `mdis = 1 − Σ_c P⁰(c)·P¹(c)` between
+two GCNs trained on the same split under the same recipe with different
+initialisations (seed and seed+100; one extra training pass) — and switches on
+the theory-given zero, with no tuning:
+
+```
+route = model  (use mdis)    if 0.5 < p_e_obs < 1.0
+route = graph (use C̃(v))     otherwise
+```
+
+The interval excludes the degenerate endpoints `p_e_obs ∈ {0, 1}`, where the
+edge classifier is a constant predictor. The rule selects the same channel
+across all five seeds on all thirteen benchmarks, and it costs one extra
+forward pass at audit time (the second member).
 
 ---
 
@@ -188,16 +224,19 @@ needed to reproduce an ablation.
 
 | Paper item | Released directory / column |
 |---|---|
-| Table I — Conflict AUC and all baselines | `results/main/…` → `AUC`, `auc_msp`, `auc_entropy`, `auc_nc`, `auc_mc` |
-| Table II — accuracies, timings, speed-up | `results/main/…` → `base_acc`, `acc_at_80_*`, `t_conflict`, `t_mc_dropout` |
-| Verdict (Trust / Unreliable) | `results/main/…` → `p_e_obs`, `q_hat`, `boundary` (`= 1/C`) |
-| Table III rows 1–4 (score operators) | `results/ablation/{binary_deg, soft_deg, soft_sym, main}` → `AUC` |
-| Table III — label-free edge scorer | `results/ablation/label_free_scorer` → `AUC` |
-| Table III — validation-tuned selection | `results/ablation/val_candidate_selection` → `AUC` |
+| Table I — routed audit, all channels, all baselines | `results/routed/final_table.json` → `aucs.routed`, `aucs.msp`, `aucs.ent`, `aucs.nc`, `aucs.mc`, `aucs.mdis`, `aucs.curate2` (edge field) |
+| Routing decisions and `p_e_obs` per dataset | `results/routed/final_table.json` → `routes`, `stable`, `per_seed.p_e_obs` |
+| Table II — abstention accuracies | `results/routed/abstain_cost.json` → `base_acc`, `acc80_routed`, `acc80_msp`, `acc80_ent`, `acc80_nc`, `acc80_mc` |
+| Table II — timings and speed-up | `results/routed/timing_single_core.log` (+ `abstain_cost.json` → `t_fwd_ms`, `t_mc_ms`) |
+| Verdict (Trust / Unreliable), q̂ | `results/routed/final_table.json` → `verdict`, `qhat`; edge-channel scalars in `results/large_scale/…` |
+| Ablation rows 1–4 (score operators) | `results/ablation/{binary_deg, soft_deg, soft_sym, main}` → `AUC` |
+| Ablation — label-free edge scorer | `results/ablation/label_free_scorer` → `AUC` |
+| Ablation — validation-tuned selection | `results/ablation/val_candidate_selection` → `AUC` |
 | Synthetic homophily control | `results/ablation/synthetic_sweep.json` |
 | GNN-depth control | `results/ablation/depth.json` |
 | Threshold protocol (validation vs oracle) | `results/main/…` → `acc_at_80_val` vs `acc_at_80_oracle` |
-| Scalability, two million-edge graphs | `results/large_scale/…` → `AUC`, `t_conflict`, `t_mc_dropout`, `p_e_obs`, `q_hat` |
+| Scalability, two million-edge graphs (edge channel) | `results/large_scale/…` → `AUC`, `t_conflict`, `t_mc_dropout`, `p_e_obs`, `q_hat` |
+| Scalability, routed recovery (0.541→0.699, 0.448→0.791) | `results/routed/final_table.json` → `penn94`, `genius` → `aucs.routed` |
 | Four-panel figures | `results/main/figures/<dataset>_conflict.png` (+ `src/make_figures.py`) |
 
 ---
@@ -242,30 +281,40 @@ catch, so such a row should be read as `Unreliable` rather than as a loss.
 
 ## 9. Reported results
 
-Eleven benchmarks, five seeds, one backbone (2-layer GCN, 64 hidden). Mean
-diagnostic AUC over misclassified test nodes:
+Thirteen benchmarks (11 standard + 2 large-scale), five seeds, one backbone
+(2-layer GCN, 64 hidden). Mean diagnostic AUC over misclassified test nodes,
+from `results/routed/final_table.json`:
 
-| Configuration | Directory | Mean AUC |
-|---|---|---|
-| Binary edge verdict, degree-normalised | `results/ablation/binary_deg` | 0.575 |
-| + soft expectation | `results/ablation/soft_deg` | 0.607 |
-| + symmetric aggregation | `results/ablation/soft_sym` | 0.653 |
-| + neighbour background (**main method**) | `results/main` | **0.657** |
-| Main method, label-free edge scorer | `results/ablation/label_free_scorer` | 0.620 |
-| Main method + validation-tuned candidate selection | `results/ablation/val_candidate_selection` | 0.692 |
-| Penn94 (41.5k nodes, 1.36M edges) | `results/large_scale` | 0.542 |
-| genius (422k nodes, 0.92M edges) | `results/large_scale` | 0.447 |
+| Dataset | route | `p_e_obs` | Routed | Edge field | MSP | MC-Dropout |
+|---|---|---|---|---|---|---|
+| Cora | model | 0.933 | 0.854 | 0.796 | 0.852 | 0.834 |
+| Citeseer | model | 0.948 | 0.770 | 0.670 | 0.758 | 0.718 |
+| Pubmed | model | 0.956 | 0.811 | 0.713 | 0.814 | 0.800 |
+| Tolokers | model | 0.931 | 0.718 | 0.593 | 0.717 | 0.736 |
+| Amazon-Ratings | graph | 0.000 | 0.506 | 0.506 | 0.593 | 0.582 |
+| Penn94 (41.5k nodes, 1.36M edges) | model | 0.676 | **0.699** | 0.541 | 0.698 | 0.670 |
+| genius (422k nodes, 0.92M edges) | model | 0.696 | **0.791** | 0.448 | 0.780 | 0.804 |
+| Chameleon-F | graph | 0.001 | 0.565 | 0.565 | 0.585 | 0.591 |
+| Squirrel-F | graph | 0.000 | **0.609** | 0.609 | 0.457 | 0.476 |
+| Texas | graph | 0.475 | **0.784** | 0.784 | 0.384 | 0.499 |
+| Cornell | graph | 0.000 | **0.778** | 0.778 | 0.467 | 0.533 |
+| Wisconsin | graph | 0.086 | **0.789** | 0.789 | 0.579 | 0.560 |
+| Actor | graph | 0.000 | 0.484 | 0.484 | 0.596 | 0.590 |
+| **Mean (13)** | | | **0.705** | 0.637 | 0.637 | 0.646 |
 
-Both large graphs return the `Unreliable` verdict (`q̂ = 0.38 / 0.27` against
-`1/C = 0.5`): they sit in the regime the theory marks as out of range, and the
-audit says so.
+The routing rule selects the same channel across all five seeds on all
+thirteen benchmarks (`routes` / `stable` in `final_table.json`). The two
+recoveries on the million-edge graphs are the largest: Penn94 0.541→0.699 and
+genius 0.448→0.791, where the edge field sits in the regime the theory marks
+as out of range — the verdict returns `Unreliable` on both (q̂ = 0.38 / 0.27
+against 1/C = 0.5), and the router reads the same scalars and switches.
 
-On the abstention side the main method reaches `+3.2` points over the unfiltered
-model at 80 % coverage on average (9 of 11 graphs positive), and the audit costs
-`4.6`–`21.6×` less than twenty-pass MC-Dropout, the margin growing with graph
-size (213 ms against 2.50 s on Tolokers, single CPU core).
-
----
+On the abstention side (`results/routed/abstain_cost.json`) the routed audit
+gains +4.65 points over the unfiltered model at 80 % coverage on average, and
+beats or matches the strongest baseline at 80 % on 9 of 13 graphs. The audit
+costs 6.2–14.2× less than twenty-pass MC-Dropout (`timing_single_core.log`;
+Penn94 4016 ms vs 25007 ms, genius 1724 ms vs 22929 ms, single CPU core), the
+margin growing with graph size.
 
 ## 10. License
 

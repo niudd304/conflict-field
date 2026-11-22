@@ -1,0 +1,44 @@
+[final] device=cuda torch=2.9.0+cu128
+cora                 h=0.810 C=7 N=2708 E=10556 p_e=0.933 routes=['model', 'model', 'model', 'model', 'model'] stable=True
+    curate2=0.7961±0.0321  msp=0.8522±0.0216  ent=0.8421±0.0240  nc=0.7123±0.0415  mc=0.8338±0.0301  mdis=0.8545±0.0232  mdis_drop2=0.8359±0.0311  routed=0.8545±0.0232
+    [t] pred=0.39s 2nd_train=0.3s mc20=0.07s  elapsed=4s
+citeseer             h=0.736 C=6 N=3327 E=9104 p_e=0.948 routes=['model', 'model', 'model', 'model', 'model'] stable=True
+    curate2=0.6702±0.0186  msp=0.7581±0.0178  ent=0.7484±0.0166  nc=0.5714±0.0255  mc=0.7182±0.0115  mdis=0.7703±0.0149  mdis_drop2=0.7199±0.0110  routed=0.7703±0.0149
+    [t] pred=0.24s 2nd_train=0.2s mc20=0.12s  elapsed=7s
+pubmed               h=0.802 C=3 N=19717 E=88648 p_e=0.956 routes=['model', 'model', 'model', 'model', 'model'] stable=True
+    curate2=0.7133±0.0124  msp=0.8142±0.0115  ent=0.8013±0.0122  nc=0.6115±0.0113  mc=0.8002±0.0134  mdis=0.8112±0.0113  mdis_drop2=0.8099±0.0127  routed=0.8112±0.0113
+    [t] pred=0.93s 2nd_train=0.8s mc20=0.36s  elapsed=18s
+chameleon_filtered   h=0.236 C=5 N=890 E=17708 p_e=0.001 routes=['graph', 'graph', 'graph', 'graph', 'graph'] stable=True
+    curate2=0.5649±0.0666  msp=0.5853±0.0199  ent=0.5291±0.0555  nc=0.5209±0.1266  mc=0.5912±0.0177  mdis=0.5539±0.0511  mdis_drop2=0.6057±0.0163  routed=0.5649±0.0666
+    [t] pred=0.34s 2nd_train=0.3s mc20=0.08s  elapsed=22s
+squirrel_filtered    h=0.207 C=5 N=2223 E=93996 p_e=0.000 routes=['graph', 'graph', 'graph', 'graph', 'graph'] stable=True
+    curate2=0.6093±0.0233  msp=0.4569±0.0502  ent=0.4300±0.0550  nc=0.5230±0.0788  mc=0.4764±0.0146  mdis=0.4330±0.0461  mdis_drop2=0.4843±0.0165  routed=0.6093±0.0233
+    [t] pred=0.69s 2nd_train=0.4s mc20=0.28s  elapsed=30s
+texas                h=0.061 C=5 N=183 E=558 p_e=0.475 routes=['graph', 'graph', 'graph', 'graph', 'graph'] stable=True
+    curate2=0.7844±0.0705  msp=0.3844±0.1044  ent=0.2891±0.0693  nc=0.5605±0.0653  mc=0.4991±0.0832  mdis=0.3956±0.1107  mdis_drop2=0.5075±0.0903  routed=0.7844±0.0705
+    [t] pred=0.22s 2nd_train=0.2s mc20=0.02s  elapsed=33s
+cornell              h=0.123 C=5 N=183 E=554 p_e=0.000 routes=['graph', 'graph', 'graph', 'graph', 'graph'] stable=True
+    curate2=0.7776±0.0361  msp=0.4669±0.0699  ent=0.4408±0.0632  nc=0.3240±0.1372  mc=0.5333±0.0658  mdis=0.4845±0.0721  mdis_drop2=0.5420±0.0634  routed=0.7776±0.0361
+    [t] pred=0.27s 2nd_train=0.3s mc20=0.02s  elapsed=36s
+wisconsin            h=0.178 C=5 N=251 E=900 p_e=0.086 routes=['graph', 'graph', 'graph', 'graph', 'graph'] stable=True
+    curate2=0.7887±0.0450  msp=0.5790±0.0632  ent=0.5679±0.0491  nc=0.4282±0.0938  mc=0.5599±0.0652  mdis=0.6029±0.0444  mdis_drop2=0.5599±0.0621  routed=0.7887±0.0450
+    [t] pred=0.39s 2nd_train=0.2s mc20=0.02s  elapsed=39s
+actor                h=0.217 C=5 N=7600 E=53318 p_e=0.000 routes=['graph', 'graph', 'graph', 'graph', 'graph'] stable=True
+    curate2=0.4843±0.0076  msp=0.5962±0.0037  ent=0.5785±0.0101  nc=0.5491±0.0088  mc=0.5900±0.0039  mdis=0.5839±0.0134  mdis_drop2=0.5918±0.0044  routed=0.4843±0.0076
+    [t] pred=0.33s 2nd_train=0.3s mc20=0.24s  elapsed=44s
+tolokers             h=0.595 C=2 N=11758 E=1038000 p_e=0.931 routes=['model', 'model', 'model', 'model', 'model'] stable=True
+    curate2=0.5929±0.0160  msp=0.7174±0.0143  ent=0.7174±0.0143  nc=0.6582±0.0121  mc=0.7365±0.0142  mdis=0.7180±0.0144  mdis_drop2=0.7365±0.0142  routed=0.7180±0.0144
+    [t] pred=1.17s 2nd_train=0.9s mc20=2.73s  elapsed=72s
+amazon_ratings       h=0.380 C=5 N=24492 E=186100 p_e=0.000 routes=['graph', 'graph', 'graph', 'graph', 'graph'] stable=True
+    curate2=0.5057±0.0037  msp=0.5931±0.0058  ent=0.5822±0.0043  nc=0.5283±0.0073  mc=0.5822±0.0042  mdis=0.5865±0.0042  mdis_drop2=0.5858±0.0043  routed=0.5057±0.0037
+    [t] pred=1.09s 2nd_train=0.9s mc20=0.92s  elapsed=88s
+penn94               h=0.470 C=2 N=41554 E=2724458 p_e=0.676 routes=['model', 'model', 'model', 'model', 'model'] stable=True
+    curate2=0.5409±0.0068  msp=0.6978±0.0042  ent=0.6978±0.0042  nc=0.4750±0.0062  mc=0.6699±0.0264  mdis=0.6985±0.0045  mdis_drop2=0.6699±0.0264  routed=0.6985±0.0045
+    [t] pred=5.55s 2nd_train=3.7s mc20=10.24s  elapsed=207s
+genius               h=0.593 C=2 N=421961 E=1845736 p_e=0.696 routes=['model', 'model', 'model', 'model', 'model'] stable=True
+    curate2=0.4477±0.0131  msp=0.7803±0.0398  ent=0.7790±0.0394  nc=0.5369±0.0374  mc=0.8039±0.0073  mdis=0.7907±0.0412  mdis_drop2=0.8044±0.0072  routed=0.7907±0.0412
+    [t] pred=2.97s 2nd_train=1.7s mc20=7.25s  elapsed=273s
+
+MEAN13 routed=0.7045 curate2=0.6366 msp=0.6371 mc=0.6457 mdis=0.6372
+routes stable on 13/13 datasets
+[final] saved -> /root/cf/final_table.json
